@@ -151,9 +151,11 @@ user's request reads it back later.
 
 ---
 
-## Issue #5: The last song in a playlist never shows up
+# Root Cause Analysis
 
-### How bug was reproduced
+## Issue #5: The last song in a playlist never shows up | `playlist_service.py`
+
+### How bug was reproduced:
 
 **Data condition:** The seeded database has a playlist called *"Late Night Vibes"*
 that contains **7 songs** (rows in the `playlist_entries` table).
@@ -174,6 +176,24 @@ that contains **7 songs** (rows in the `playlist_entries` table).
    ```bash
    curl -s "http://127.0.0.1:5000/playlists/<playlist_id>/songs" | python -m json.tool
    ```
+   This endpoint doesn't contain the logic itself — the `GET
+   /playlists/<id>/songs` route in [routes/playlists.py](routes/playlists.py)
+   simply calls the service function `get_playlist_songs()` in
+   [services/playlist_service.py](services/playlist_service.py) and wraps the
+   result as `{"songs": ..., "count": len(songs)}`. So the `count` in the
+   response is just the length of whatever that function returns — hitting the
+   endpoint is exercising the real function, one layer removed.
+4. To confirm the bug is in the service function and not the route wrapper, I
+   also called `get_playlist_songs()` directly against the seeded database (no
+   server needed):
+   ```bash
+   python -c "from app import create_app, db; from models import Playlist; from services.playlist_service import get_playlist_songs; app=create_app();
+   app.app_context().push();
+   pid=db.session.query(Playlist).filter_by(name='Late Night Vibes').first().id;
+   print('returned:', len(get_playlist_songs(pid)))"
+   ```
+   This printed `returned: 6`, matching the endpoint — confirming the function
+   itself is dropping a song, independent of the HTTP layer.
 
 **What happened (the bug):** The endpoint returned `"count": 6` — only **6**
 songs, even though the playlist has **7**. The song in the last position is
@@ -182,6 +202,40 @@ always missing.
 **Trigger:** Any playlist with one or more songs. The last song (highest
 `position`) is always dropped, so the returned count is always one less than the
 real count.
+
+### How root cause was found:
+
+The README identified `playlist_service.py` as the relevant file. I traced the
+request from `routes/playlists.py`, where `GET /playlists/<id>/songs` delegates
+directly to `get_playlist_songs()`, into that function. Reading it top to bottom,
+the query and ordering were clearly correct, which left the return statement as
+the only remaining suspect — and its list slice confirmed the cause.
+
+### Root cause:
+
+The function ends with `return [song.to_dict() for song in songs[:-1]]`. The
+`[:-1]` slice excludes the final element of the list, so the song with the
+highest `position` is discarded before the response is built. The data and the
+query are correct; the last song is dropped solely by this slice in the return
+statement.
+
+### Fix and Side-Effect Check:
+
+I changed the return statement from
+`return [song.to_dict() for song in songs[:-1]]` to
+`return [song.to_dict() for song in songs]`. Removing the `[:-1]` slice means the
+function now iterates over every song the query returned, including the one at the
+highest `position`. This addresses the root cause directly, since the slice was
+the only place a song was being dropped.
+
+Afterward I checked the other code that touches the same feature. The
+`GET /playlists/<id>/songs` route in `routes/playlists.py` only reports
+`len(songs)`, so it needs no change and now returns the correct count.
+`add_to_playlist()` in `notification_service.py` imports `get_playlist_songs` but
+never calls it, so the add-and-notify flow is unaffected. Finally I ran
+`tests/test_playlists.py`, which covers an empty playlist, a multi-song playlist,
+and song ordering; all three pass, confirming the fix works on both sides of the
+boundary without breaking the empty-playlist case.
 
 ---
 
@@ -224,6 +278,8 @@ count was still `"count": 0` afterward. She was never told her song was rated.
 **Trigger:** Any user rating another user's song. Rating saves the score but
 never creates a notification for the song's sharer — unlike adding a song to a playlist, which does notify the sharer.
 
+--- 
+# Root Cause Analysis
 
 ## Issue #1: My listening streak keeps resetting
 
@@ -289,6 +345,10 @@ it had accumulated — resets to `1`. In `update_listening_streak()` the increme
 branch is guarded by `days_since_last == 1 and today.weekday() != 6`; because
 Sunday is `weekday() == 6`, that condition is false and the code falls through to
 the `else` branch that resets the streak to `1`.
+
+
+
+
 
 
 
