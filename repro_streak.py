@@ -1,9 +1,11 @@
 """
-repro_streak.py — reproduce the "streak keeps resetting" bug.
+repro_streak.py — verify the "streak keeps resetting" fix.
 
 Runs every consecutive-day pair across a full week with a fresh user each time
-and prints whether the streak incremented or reset. Only the pair ending on
-Sunday should break, isolating the bug to weekday() == 6.
+and prints whether the streak incremented or reset. After the weekday()==6 fix,
+every consecutive-day pair — including the one ending on Sunday — should
+increment. A collapse is flagged only when the streak actually resets to 1 on a
+consecutive day, instead of being assumed for Sunday.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -29,8 +31,8 @@ with app.app_context():
               f"streak={u.listening_streak}  {verdict}")
 
     # --- Demonstration 2: a continuous streak built up Mon..Sun ---
-    # Shows that it does NOT matter how long the streak is: any streak that
-    # reaches Sunday collapses back to 1, even a 6-day run.
+    # A run of consecutive days should climb 1..7 without interruption; the
+    # Sunday entry must keep climbing, not collapse back to 1.
     print("\nContinuous streak, listening every day Mon..Sun:")
     u = User(username="continuous", email="c@x.app")
     db.session.add(u)
@@ -38,12 +40,13 @@ with app.app_context():
     for offset in range(7):
         day = datetime(2024, 6, 10, 12, 0, tzinfo=timezone.utc) + timedelta(days=offset)
         update_listening_streak(u, day)
-        flag = "  <-- BUG: collapsed" if names[day.weekday()] == "Sun" else ""
+        expected = offset + 1
+        flag = "  <-- BUG: collapsed" if u.listening_streak != expected else ""
         print(f"  {names[day.weekday()]} 2024-06-{10 + offset}: streak={u.listening_streak}{flag}")
 
     # --- Demonstration 3: a continuous streak built up Sun..Sat ---
     # Starting ON a Sunday is fine (day 1 always starts at 1), and the rest of
-    # the week builds normally. The reset only ever fires when *today* is Sunday.
+    # the week builds normally 1..7.
     print("\nContinuous streak, listening every day Sun..Sat:")
     u = User(username="continuous2", email="c2@x.app")
     db.session.add(u)
@@ -51,5 +54,6 @@ with app.app_context():
     for offset in range(7):
         day = datetime(2024, 6, 16, 12, 0, tzinfo=timezone.utc) + timedelta(days=offset)
         update_listening_streak(u, day)
-        flag = "  <-- BUG: collapsed" if names[day.weekday()] == "Sun" else ""
+        expected = offset + 1
+        flag = "  <-- BUG: collapsed" if u.listening_streak != expected else ""
         print(f"  {names[day.weekday()]} 2024-06-{16 + offset}: streak={u.listening_streak}{flag}")

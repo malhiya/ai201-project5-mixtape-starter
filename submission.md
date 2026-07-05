@@ -389,6 +389,74 @@ Sunday is `weekday() == 6`, that condition is false and the code falls through t
 the `else` branch that resets the streak to `1`.
 
 
+### How the root cause was found:
+
+The full-week sweep (Demonstration 1) isolated the failure to a single transition:
+every consecutive-day pair incremented *except* `Sat -> Sun`, which reset to `1`.
+The control case (Demonstration 3) showed that starting a streak on Sunday was
+fine — only *ending* a day's listen on a Sunday broke. That pointed the
+investigation at day-of-week handling in the increment path rather than at the
+date-difference math or the streak counter itself. Reading
+`update_listening_streak()` in `services/streak_service.py`, the increment branch
+was guarded by `days_since_last == 1 and today.weekday() != 6`. Since
+`weekday() == 6` is Sunday, the guard was the only piece of logic that singled
+out one weekday — matching exactly the one day the sweep flagged.
+
+### Root Cause:
+
+In `update_listening_streak()`, the consecutive-day increment branch carried a
+spurious extra condition:
+
+```python
+elif days_since_last == 1 and today.weekday() != 6:
+    user.listening_streak += 1
+```
+
+The `and today.weekday() != 6` clause has no basis in the documented streak rules
+("if the user listened yesterday, the streak increments by 1"). When today is a
+Sunday (`weekday() == 6`) the whole condition evaluates to `False` even for a
+genuine consecutive-day listen, so control falls through to the `else` branch,
+which resets `listening_streak` to `1`. The result: any streak that continues
+onto a Sunday collapses back to `1`.
+
+### Fix and Side-Effect Check:
+
+**Fix** — removed only the extraneous weekday clause so the branch matches the
+documented rule (`services/streak_service.py`):
+
+```python
+elif days_since_last == 1:
+    user.listening_streak += 1
+```
+
+This is the minimal change: one condition removed, no surrounding logic touched.
+
+**Side-effect check** — I traced every place that reads or writes the same data
+and feature:
+- `tests/test_streaks.py` — full suite passes; `test_streak_increments_on_sunday`
+  (Sat→Sun) now passes, and the existing first-listen / consecutive /
+  same-day / skipped-day cases are unaffected (they don't involve Sunday).
+- `routes/songs.py` → `record_listening_event()` → `update_listening_streak()` —
+  the live path; behavior changes only on Sundays, and only in the correct
+  direction.
+- `routes/users.py` → `get_streak()` — read-only, returns the stored value;
+  unaffected.
+- `services/feed_service.py` — reads `ListeningEvent` rows for the feed; never
+  touches `listening_streak`; unaffected.
+- `seed_data.py` / `models.py` — set streak values directly, independent of the
+  increment logic.
+
+**Boundary verification (both sides of the Sunday boundary):**
+- *Into Sunday* (Sat → Sun): now increments — the case that was broken.
+- *Out of Sunday* (Sun → Mon): still increments — no regression on the side that
+  already worked.
+- A continuous Mon..Sun run now climbs `1..7` with no collapse at the Sunday
+  index; same-day and skipped-day behavior on a Sunday still correctly hold
+  (no change / reset to `1`).
+
+The `repro_streak.py` script was updated to flag a collapse based on the *actual*
+streak value rather than assuming Sunday, so it now serves as a regression check:
+with the fix in place every row reads clean.
 
 
 
@@ -408,37 +476,3 @@ the `else` branch that resets the streak to `1`.
 
 
 
-
-
-
-
-## Patterns I noticed in how the app is organized
-
-1. **Strict routes → services → models layering.** Every route delegates almost
-   immediately to a service function. Routes only do input parsing and JSON
-   formatting; all business logic and database access lives in `services/`. This
-   keeps the web layer thin and makes the logic easy to find and test.
-
-2. **Errors flow upward as `ValueError`.** Services raise `ValueError` when
-   something is missing (bad user, missing song, etc.). Routes wrap service calls
-   in `try/except ValueError` and convert them into HTTP 400/404 responses. The
-   services never touch HTTP, and the routes never contain rules — a clean split.
-
-3. **UUID string primary keys everywhere.** Every model's `id` defaults to
-   `generate_uuid()`, so IDs are random strings rather than auto-incrementing
-   numbers. IDs can be generated before saving and don't leak record counts.
-
-4. **`to_dict()` on every model is the JSON boundary.** Routes never build JSON
-   by hand from model fields; they call `to_dict()`. This gives one consistent
-   place per model that decides which fields are exposed to the outside world.
-
-5. **Features are decoupled through the database, not direct calls.** Listening
-   and the feed are a good example: the `/listen` action just writes a
-   `ListeningEvent` row, and the feed is computed *later* from those rows when a
-   friend asks for it. The same is true for notifications. Actions leave data
-   behind; other parts of the app read that data on demand.
-
-6. **Relationships and join tables carry extra meaning.** The `playlist_entries`
-   join table isn't just a link — it stores `position`, `added_by`, and
-   `added_at`, so a playlist knows the order of its songs and who added each one.
-   Friendships use a self-referential many-to-many table on `User`.
