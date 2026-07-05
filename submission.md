@@ -278,8 +278,50 @@ count was still `"count": 0` afterward. She was never told her song was rated.
 **Trigger:** Any user rating another user's song. Rating saves the score but
 never creates a notification for the song's sharer — unlike adding a song to a playlist, which does notify the sharer.
 
+
+### How the root cause was found:
+
+The README identified `notification_service.py` as the relevant file. Since
+adding a song to a playlist *does* notify the sharer, I compared the two
+functions in that file side by side. `add_to_playlist()` looks up the song,
+performs its write, and then calls `create_notification()` for `song.shared_by`.
+Reading `rate_song()` the same way, it looks up the song and user, saves or
+updates the `Rating`, commits, and returns — with no `create_notification()`
+call anywhere. The notification step present in every other interaction was
+simply missing from this one.
+
+### Root Cause:
+
+`rate_song()` saved the rating but never created a notification. After
+committing the `Rating`, the function returned immediately, so the song's
+sharer was never informed. Unlike `add_to_playlist()`, it had no
+`create_notification()` call for `song.shared_by`, which is why rating another
+user's song produced no notification even though the score was recorded
+correctly.
+
+### Fix and Side-Effect Check:
+
+I added the missing notification step to `rate_song()`, mirroring the pattern
+already used by `add_to_playlist()`: after the rating is committed, if the rater
+is not the song's sharer (`song.shared_by != user_id`), the function calls
+`create_notification()` for `song.shared_by` with a `"song_rated"` type and a
+message like *"nova rated your song 'Crown Heights Anthem' 5 out of 5."* The
+self-check prevents users from being notified about rating their own songs, the
+same guard `add_to_playlist()` uses.
+
+Afterward I checked the code that touches the same feature. The
+`POST /songs/<id>/rate` route in `routes/songs.py` is the only caller; it just
+returns `rating.to_dict()`, and since the notification is created after the
+rating is committed and the same `rating` object is still returned, the route's
+response is unchanged. `create_notification()` performs its own commit, but the
+rating was already persisted, so nothing is detached or lost. The
+`UniqueConstraint` on `Rating` is untouched — re-rating still updates the
+existing row rather than inserting a duplicate, and simply fires a fresh
+notification. I confirmed the behavior end to end: after nova rated simone's
+song, simone's notification count went from `0` to `1` with the expected
+`song_rated` message, and rating one's own song still produces no notification.
+
 --- 
-# Root Cause Analysis
 
 ## Issue #1: My listening streak keeps resetting
 
