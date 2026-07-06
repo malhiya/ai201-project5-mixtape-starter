@@ -1,5 +1,25 @@
 # Mixtape — Codebase Map
 
+## AI Usage
+
+I used Claude Code to summarize how the three layers (routes, services, models) fit together, which gave me a fast map of where each feature lived. Two specific uses stood out during debugging. First, for the playlist bug I asked it to trace
+what happens when I hit `GET /playlists/<id>/songs`; it explained that the route in `routes/playlists.py` just delegates to `get_playlist_songs()` in `playlist_service.py` and only reports `len(songs)`, which pointed me straight to
+the service function where the slice bug at the end that was dropping the last song.
+
+Second, for the streak-reset bug I asked it write a full-week sweep script that checks different cases to understand what the bug is and even later use it as a test after the bug fix. This helped me get a better understandng of what was happening. 
+
+One place I had to correct the AI's code was the full-week script
+`repro_streak.py`. Its first version flagged the bug by hard-coding the Sunday
+case, but that meant the script only worked because it already assumed where the
+problem was — it couldn't be reused to confirm the fix afterward. So I asked
+Claude Code to rewrite it to detect the failure from the expected result (a
+consecutive-day listen should increment the streak) rather than from the known
+Sunday condition, which made it a genuine test that still passes after the fix. 
+
+I also used Claude Code to help me put together the terminal `curl` commands and the small repro scripts I ran to test each bug, which saved time on the exact syntax for hitting the endpoints and querying the SQLite database. In every case I confirmed the fix myself by reproducing the bug and running the tests rather than trusting the AI's summary. 
+
+## App description 
+
 Mixtape is a small Flask + SQLAlchemy web app where friends share songs, rate
 them, build collaborative playlists, keep a daily listening streak, and see a
 "friends listening now" feed. This is a map of how the code is put together.
@@ -153,6 +173,7 @@ user's request reads it back later.
 
 # Root Cause Analysis
 
+
 ## Issue #5: The last song in a playlist never shows up | `playlist_service.py`
 
 ### How bug was reproduced:
@@ -203,7 +224,7 @@ always missing.
 `position`) is always dropped, so the returned count is always one less than the
 real count.
 
-### How root cause was found:
+### Navigation Strategy:
 
 The README identified `playlist_service.py` as the relevant file. I traced the
 request from `routes/playlists.py`, where `GET /playlists/<id>/songs` delegates
@@ -219,7 +240,7 @@ highest `position` is discarded before the response is built. The data and the
 query are correct; the last song is dropped solely by this slice in the return
 statement.
 
-### Fix and Side-Effect Check:
+### Fix:
 
 I changed the return statement from
 `return [song.to_dict() for song in songs[:-1]]` to
@@ -228,7 +249,8 @@ function now iterates over every song the query returned, including the one at t
 highest `position`. This addresses the root cause directly, since the slice was
 the only place a song was being dropped.
 
-Afterward I checked the other code that touches the same feature. The
+### Side-Effect Check:
+I checked the other code that touches the same feature. The
 `GET /playlists/<id>/songs` route in `routes/playlists.py` only reports
 `len(songs)`, so it needs no change and now returns the correct count.
 `add_to_playlist()` in `notification_service.py` imports `get_playlist_songs` but
@@ -279,7 +301,7 @@ count was still `"count": 0` afterward. She was never told her song was rated.
 never creates a notification for the song's sharer — unlike adding a song to a playlist, which does notify the sharer.
 
 
-### How the root cause was found:
+### Navigation Strategy:
 
 The README identified `notification_service.py` as the relevant file. Since
 adding a song to a playlist *does* notify the sharer, I compared the two
@@ -299,7 +321,7 @@ sharer was never informed. Unlike `add_to_playlist()`, it had no
 user's song produced no notification even though the score was recorded
 correctly.
 
-### Fix and Side-Effect Check:
+### Fix:
 
 I added the missing notification step to `rate_song()`, mirroring the pattern
 already used by `add_to_playlist()`: after the rating is committed, if the rater
@@ -309,7 +331,9 @@ message like *"nova rated your song 'Crown Heights Anthem' 5 out of 5."* The
 self-check prevents users from being notified about rating their own songs, the
 same guard `add_to_playlist()` uses.
 
-Afterward I checked the code that touches the same feature. The
+
+### Side-Effect Check:
+I checked the code that touches the same feature. The
 `POST /songs/<id>/rate` route in `routes/songs.py` is the only caller; it just
 returns `rating.to_dict()`, and since the notification is created after the
 rating is committed and the same `rating` object is still returned, the route's
@@ -389,7 +413,7 @@ Sunday is `weekday() == 6`, that condition is false and the code falls through t
 the `else` branch that resets the streak to `1`.
 
 
-### How the root cause was found:
+### Navigation Strategy:
 
 The full-week sweep (Demonstration 1) isolated the failure to a single transition:
 every consecutive-day pair incremented *except* `Sat -> Sun`, which reset to `1`.
@@ -404,8 +428,7 @@ out one weekday — matching exactly the one day the sweep flagged.
 
 ### Root Cause:
 
-In `update_listening_streak()`, the consecutive-day increment branch carried a
-spurious extra condition:
+In `update_listening_streak()`, the consecutive-day increment branch carried an extra condition:
 
 ```python
 elif days_since_last == 1 and today.weekday() != 6:
@@ -419,9 +442,9 @@ genuine consecutive-day listen, so control falls through to the `else` branch,
 which resets `listening_streak` to `1`. The result: any streak that continues
 onto a Sunday collapses back to `1`.
 
-### Fix and Side-Effect Check:
+### Fix: 
 
-**Fix** — removed only the extraneous weekday clause so the branch matches the
+ Removed only the extraneous weekday clause so the branch matches the
 documented rule (`services/streak_service.py`):
 
 ```python
@@ -431,8 +454,8 @@ elif days_since_last == 1:
 
 This is the minimal change: one condition removed, no surrounding logic touched.
 
-**Side-effect check** — I traced every place that reads or writes the same data
-and feature:
+### Side-Effect Check: 
+I traced every place that reads or writes the same data and feature:
 - `tests/test_streaks.py` — full suite passes; `test_streak_increments_on_sunday`
   (Sat→Sun) now passes, and the existing first-listen / consecutive /
   same-day / skipped-day cases are unaffected (they don't involve Sunday).
@@ -454,9 +477,7 @@ and feature:
   index; same-day and skipped-day behavior on a Sunday still correctly hold
   (no change / reset to `1`).
 
-The `repro_streak.py` script was updated to flag a collapse based on the *actual*
-streak value rather than assuming Sunday, so it now serves as a regression check:
-with the fix in place every row reads clean.
+
 
 
 
